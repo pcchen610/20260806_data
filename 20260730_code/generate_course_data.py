@@ -20,11 +20,25 @@ SEED = 20260217
 START_DATE = datetime(2024, 1, 1)
 END_DATE = datetime(2025, 12, 31)
 
+# Months with major holidays or shopping campaigns in Taiwan.  The multiplier
+# controls order frequency; keeping it moderate leaves useful random variation.
+PEAK_MONTHS = {1, 2, 5, 8, 10, 11, 12}
+MONTH_ORDER_WEIGHT = {month: (1.55 if month in PEAK_MONTHS else 1.0) for month in range(1, 13)}
+
 
 def random_date(rng: random.Random, start: datetime, end: datetime) -> datetime:
     """在指定日期區間內隨機抽出一天。"""
     delta_days = (end - start).days
     return start + timedelta(days=rng.randint(0, delta_days))
+
+
+def random_order_date(rng: random.Random, start: datetime, end: datetime) -> datetime:
+    """Sample an order date with higher probability in campaign months."""
+    max_weight = max(MONTH_ORDER_WEIGHT.values())
+    while True:
+        candidate = random_date(rng, start, end)
+        if rng.random() < MONTH_ORDER_WEIGHT[candidate.month] / max_weight:
+            return candidate
 
 
 def write_csv(path: Path, rows: list[dict], headers: list[str]) -> None:
@@ -52,7 +66,11 @@ def generate_customers(rng: random.Random, n: int = 2500) -> list[dict]:
             {
                 "customer_id": cid,
                 "signup_date": signup.date().isoformat(),
-                "acquisition_channel": rng.choice(channels),
+                # Paid and word-of-mouth channels are the main acquisition mix.
+                "acquisition_channel": rng.choices(
+                    channels,
+                    weights=[0.10, 0.32, 0.22, 0.08, 0.28],
+                )[0],
                 "city": rng.choice(cities),
                 "segment": segment,
             }
@@ -90,15 +108,26 @@ def generate_orders_and_items(
     # 先建立查表用的 dict/list，讓後面可以快速依商品 ID 找價格、依顧客清單抽樣。
     product_prices = {int(p["product_id"]): int(p["unit_price"]) for p in products}
     customer_ids = [int(c["customer_id"]) for c in customers]
+    customer_segments = {int(c["customer_id"]): str(c["segment"]) for c in customers}
+
+    # VIP customers buy more often as well as placing larger orders.
+    customer_weights = {
+        cid: {"new": 0.75, "growth": 1.15, "vip": 2.20}[customer_segments[cid]]
+        for cid in customer_ids
+    }
 
     orders: list[dict] = []
     items: list[dict] = []
     for oid in range(1, n_orders + 1):
-        order_dt = random_date(rng, START_DATE, END_DATE)
+        order_dt = random_order_date(rng, START_DATE, END_DATE)
 
         # 大多數訂單為完成狀態，少數取消或退款。
         status = rng.choices(statuses, weights=[0.93, 0.04, 0.03])[0]
-        customer_id = rng.choice(customer_ids)
+        customer_id = rng.choices(
+            customer_ids,
+            weights=[customer_weights[cid] for cid in customer_ids],
+        )[0]
+        segment = customer_segments[customer_id]
 
         # 不同付款方式也用權重模擬實務上的使用比例。
         payment_type = rng.choices(payment_types, weights=[0.5, 0.25, 0.1, 0.15])[0]
@@ -114,10 +143,26 @@ def generate_orders_and_items(
         )
 
         # 一張訂單可包含多個商品，且通常 1 到 2 個品項最多。
-        n_items = rng.choices([1, 2, 3, 4], weights=[0.45, 0.35, 0.15, 0.05])[0]
+        item_count_weights = {
+            "new": [0.56, 0.31, 0.10, 0.03],
+            "growth": [0.40, 0.36, 0.18, 0.06],
+            "vip": [0.18, 0.34, 0.30, 0.18],
+        }
+        n_items = rng.choices([1, 2, 3, 4], weights=item_count_weights[segment])[0]
         for _ in range(n_items):
-            product_id = rng.randint(1, len(products))
-            qty = rng.choices([1, 2, 3], weights=[0.8, 0.17, 0.03])[0]
+            # VIPs have a mild preference for higher-priced products.  Sorting by
+            # price avoids making category itself a proxy for customer segment.
+            if segment == "vip" and rng.random() < 0.60:
+                premium_ids = sorted(product_prices, key=product_prices.get)[len(products) // 2 :]
+                product_id = rng.choice(premium_ids)
+            else:
+                product_id = rng.randint(1, len(products))
+            qty_weights = {
+                "new": [0.86, 0.12, 0.02],
+                "growth": [0.76, 0.20, 0.04],
+                "vip": [0.60, 0.30, 0.10],
+            }
+            qty = rng.choices([1, 2, 3], weights=qty_weights[segment])[0]
             list_price = product_prices[product_id]
 
             # 折扣率保留在明細層，後續可練習計算營收、折扣影響與毛額。
